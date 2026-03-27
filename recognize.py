@@ -1,145 +1,156 @@
-import os
 import cv2
-import pandas as pd
+import numpy as np
 import requests
+import base64
 import threading
+import time
 
 # -------------------------------------------------------
 # recognize.py
-# Opens camera, recognizes faces, notifies server.py
-# which then marks attendance on Railway backend.
+# Fetches face encodings from Railway at startup.
+# Opens camera, recognizes faces, POSTs attendance to backend.
+# Optionally notifies server.py for display monitor.
 # -------------------------------------------------------
 
+BACKEND_URL = "https://facial-recognition-attendance-backend-production.up.railway.app"
 DISPLAY_SERVER = "http://localhost:5050"
 
+
+def load_encodings_from_backend():
+    """Fetch all face encodings from Railway at startup."""
+    print("Loading face encodings from backend...")
+    try:
+        res = requests.get(f"{BACKEND_URL}/api/get-encodings/", timeout=10)
+        data = res.json()
+        known_encodings = []
+        known_students = []
+        for entry in data.get("encodings", []):
+            encoding_bytes = base64.b64decode(entry["encoding"])
+            encoding = np.frombuffer(encoding_bytes, dtype=np.float64)
+            known_encodings.append(encoding)
+            known_students.append({
+                "name": entry["name"],
+                "registration_number": entry["registration_number"],
+                "department": entry.get("department", "")
+            })
+        print(f"✓ Loaded {len(known_encodings)} face encoding(s).")
+        return known_encodings, known_students
+    except Exception as e:
+        print(f"✗ Failed to load encodings: {e}")
+        return [], []
+
+
+def mark_attendance_api(reg_no, classroom):
+    """POST to Railway to record attendance."""
+    try:
+        res = requests.post(f"{BACKEND_URL}/api/mark-attendance/", json={
+            "registration_number": reg_no,
+            "classroom": classroom
+        }, timeout=5)
+        if res.status_code in [200, 201]:
+            print(f"  → Attendance marked for {reg_no}")
+        else:
+            print(f"  → Backend: {res.json().get('error', 'unknown error')}")
+    except Exception as e:
+        print(f"  → Could not reach backend: {e}")
+
+
 def notify_display(name, reg_no, department, confidence_pct, classroom):
-    """Tell server.py a face was detected — runs in background thread"""
+    """Notify local display server (optional)."""
     try:
         requests.post(f"{DISPLAY_SERVER}/detected", json={
-            "name": name,
-            "reg_no": reg_no,
-            "department": department,
-            "confidence": confidence_pct,
+            "name": name, "reg_no": reg_no,
+            "department": department, "confidence": confidence_pct,
             "classroom": classroom
         }, timeout=2)
-    except Exception as e:
-        print(f"Display server not reachable: {e}")
+    except:
+        pass
+
 
 def clear_display_after_delay(seconds=3):
-    """Wait then reset display — runs in background so camera doesn't freeze"""
-    import time
     time.sleep(seconds)
     try:
         requests.post(f"{DISPLAY_SERVER}/clear", timeout=2)
     except:
         pass
 
+
 def recognize_attendance():
-    # Load trained model
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
-    recognizer.read("./TrainingImageLabel/Trainner.yml")
+    try:
+        import face_recognition
+    except ImportError:
+        print("✗ face_recognition not installed. Run: pip install face-recognition")
+        return
 
-    harcascadePath = "haarcascade_frontalface_default.xml"
-    faceCascade = cv2.CascadeClassifier(harcascadePath)
+    known_encodings, known_students = load_encodings_from_backend()
 
-    # Load student details CSV — ensure Id column is integer for matching
-    df = pd.read_csv("StudentDetails" + os.sep + "StudentDetails.csv")
-    df['Id'] = df['Id'].astype(int)
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
+    if not known_encodings:
+        print("✗ No face encodings found. Register student faces first via the admin panel.")
+        return
 
     classroom = input("Enter Classroom (e.g. 301): ").strip()
-
-    # Track who has already been marked this session
     marked = set()
 
-    # Start camera — try index 0 then 1
+    # Start camera
     cam = cv2.VideoCapture(0)
     if not cam.isOpened():
         cam = cv2.VideoCapture(1)
     if not cam.isOpened():
-        print("ERROR: Could not open camera.")
+        print("✗ Could not open camera.")
         return
 
     cam.set(3, 640)
     cam.set(4, 480)
 
-    minW = 0.1 * cam.get(3)
-    minH = 0.1 * cam.get(4)
-
-    print("\nRecognizing faces... Press 'q' to stop.\n")
+    print(f"\nRecognizing faces for classroom {classroom}... Press 'q' to stop.\n")
 
     while True:
-        _, im = cam.read()
-        if im is None:
+        ret, frame = cam.read()
+        if not ret or frame is None:
             continue
 
-        gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-        faces = faceCascade.detectMultiScale(
-            gray, 1.2, 5,
-            minSize=(int(minW), int(minH)),
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
+        # Resize to 50% for faster processing
+        small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+        rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-        for (x, y, w, h) in faces:
-            cv2.rectangle(im, (x, y), (x+w, y+h), (10, 159, 255), 2)
-            Id, conf = recognizer.predict(gray[y:y+h, x:x+w])
-            confidence_pct = round(100 - conf)
+        face_locations = face_recognition.face_locations(rgb_small)
+        face_encodings = face_recognition.face_encodings(rgb_small, face_locations)
 
-            if conf < 100:
-                # Id from recognizer is int, CSV Id column is also int now
-                student_row = df.loc[df['Id'] == Id]
-                if not student_row.empty:
-                    name = student_row['Name'].values[0]
-                    reg_no = str(student_row['RegistrationNumber'].values[0])
-                    department = str(student_row['Department'].values[0]) if 'Department' in df.columns else ''
+        for face_encoding, face_location in zip(face_encodings, face_locations):
+            distances = face_recognition.face_distance(known_encodings, face_encoding)
+            best_idx = int(np.argmin(distances))
+            best_distance = distances[best_idx]
+            confidence_pct = round((1 - best_distance) * 100, 1)
+
+            if best_distance < 0.6:
+                student = known_students[best_idx]
+                name = student["name"]
+                reg_no = student["registration_number"]
+                department = student["department"]
+                colour = (0, 255, 0)
+
+                if reg_no not in marked:
+                    marked.add(reg_no)
+                    print(f"✓ Detected: {name} ({reg_no}) — {confidence_pct}% confidence")
+
+                    threading.Thread(target=mark_attendance_api, args=(reg_no, classroom), daemon=True).start()
+                    threading.Thread(target=notify_display, args=(name, reg_no, department, confidence_pct, classroom), daemon=True).start()
+                    threading.Thread(target=clear_display_after_delay, args=(3,), daemon=True).start()
+
+                    label = f"{name} [Marked] {confidence_pct}%"
                 else:
-                    name = "Unknown"
-                    reg_no = None
-                    department = ''
-            else:
-                name = "Unknown"
-                reg_no = None
-                department = ''
-
-            # Mark if confidence > 67% and not already marked
-            if confidence_pct > 67 and reg_no and reg_no not in marked:
-                marked.add(reg_no)
-                print(f"Detected: {name} ({reg_no}) — {confidence_pct}% confidence")
-
-                # Notify display in background (doesn't freeze camera)
-                threading.Thread(
-                    target=notify_display,
-                    args=(name, reg_no, department, confidence_pct, classroom),
-                    daemon=True
-                ).start()
-
-                # Clear display after 3 seconds in background
-                threading.Thread(
-                    target=clear_display_after_delay,
-                    args=(3,),
-                    daemon=True
-                ).start()
-
-                label = f"{name} [Marked]"
-
-            elif confidence_pct > 67 and reg_no:
-                label = f"{name} [Already Marked]"
+                    label = f"{name} [Already Marked]"
+                    colour = (0, 255, 255)
             else:
                 label = "Unknown"
-
-            cv2.putText(im, label, (x+5, y-5), font, 1, (255, 255, 255), 2)
-
-            conf_text = f"{confidence_pct}%"
-            if confidence_pct > 67:
-                colour = (0, 255, 0)
-            elif confidence_pct > 50:
-                colour = (0, 255, 255)
-            else:
                 colour = (0, 0, 255)
-            cv2.putText(im, conf_text, (x+5, y+h-5), font, 1, colour, 1)
 
-        cv2.imshow('Attendance', im)
+            # Scale face location back up and draw
+            top, right, bottom, left = [v * 2 for v in face_location]
+            cv2.rectangle(frame, (left, top), (right, bottom), colour, 2)
+            cv2.putText(frame, label, (left + 5, top - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2)
+
+        cv2.imshow("Attendance Recognition", frame)
 
         if cv2.waitKey(1) == ord('q'):
             break

@@ -1,3 +1,4 @@
+face-recognition
 flask
 flask-cors
 opencv-contrib-python>=4.0.1
