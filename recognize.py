@@ -18,7 +18,7 @@ DISPLAY_SERVER = "http://localhost:5050"
 # ── Blink detection tuning ─────────────────────────────
 # EAR = Eye Aspect Ratio. When your eye is open, EAR ≈ 0.3.
 # When you blink, EAR drops below 0.25 for a few frames.
-EAR_THRESHOLD = 0.25       # below this = eye is closed
+EAR_THRESHOLD = 0.15       # below this = eye is closed (bbox ratio scale)
 EAR_CONSEC_FRAMES = 2      # must be closed for this many frames to count as a blink
 BLINK_REQUIRED = 1         # number of blinks needed before marking attendance
 # ───────────────────────────────────────────────────────
@@ -48,29 +48,28 @@ def eye_aspect_ratio(eye_points):
 
 def get_ear_from_landmarks(landmarks):
     """
-    Extract left and right eye points from face_recognition landmarks
-    and return the average EAR for both eyes.
-    face_recognition gives us named landmark groups like:
-      landmarks["left_eye"]  → list of (x, y) points around the left eye
-      landmarks["right_eye"] → list of (x, y) points around the right eye
+    Calculate Eye Aspect Ratio from face_recognition landmarks.
+    Instead of relying on point ordering (which varies), we use the
+    bounding box of all eye points:
+      EAR = eye height / eye width
+    When open: ~0.3  |  When closed: ~0.05
     """
-    left_eye = landmarks.get("left_eye", [])
+    left_eye  = landmarks.get("left_eye",  [])
     right_eye = landmarks.get("right_eye", [])
 
-    if len(left_eye) < 6 or len(right_eye) < 6:
-        return None  # not enough points, skip this frame
+    if len(left_eye) < 4 or len(right_eye) < 4:
+        return None
 
-    # Pick 6 key points from each eye (face_recognition gives more points,
-    # we take evenly spaced ones to get the standard 6-point EAR shape)
-    def pick_six(pts):
-        pts = list(pts)
-        n = len(pts)
-        indices = [0, n//5, 2*n//5, n//2, 3*n//5, 4*n//5]
-        return [pts[i] for i in indices]
+    def bbox_ear(pts):
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        width  = max(xs) - min(xs)
+        height = max(ys) - min(ys)
+        if width == 0:
+            return 0.0
+        return height / width
 
-    left_ear = eye_aspect_ratio(pick_six(left_eye))
-    right_ear = eye_aspect_ratio(pick_six(right_eye))
-    return (left_ear + right_ear) / 2.0
+    return (bbox_ear(left_eye) + bbox_ear(right_eye)) / 2.0
 
 
 def load_encodings_from_backend():
@@ -257,7 +256,7 @@ def recognize_attendance():
 
         cv2.imshow("Attendance Recognition", frame)
 
-        if cv2.waitKey(1) == ord('q'):
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     print(f"\nSession ended. {len(marked)} student(s) marked present.")
