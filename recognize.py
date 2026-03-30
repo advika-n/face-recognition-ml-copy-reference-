@@ -26,7 +26,8 @@ def load_encodings_from_backend():
         known_students = []
         for entry in data.get("encodings", []):
             encoding_bytes = base64.b64decode(entry["encoding"])
-            encoding = np.frombuffer(encoding_bytes, dtype=np.float64)
+            # InsightFace uses 512-d float32 (was float64 for dlib)
+            encoding = np.frombuffer(encoding_bytes, dtype=np.float32)
             known_encodings.append(encoding)
             known_students.append({
                 "name": entry["name"],
@@ -77,9 +78,9 @@ def clear_display_after_delay(seconds=3):
 
 def recognize_attendance():
     try:
-        import face_recognition
+        import insightface
     except ImportError:
-        print("✗ face_recognition not installed. Run: pip install face-recognition")
+        print("✗ insightface not installed. Run: pip install insightface onnxruntime")
         return
 
     known_encodings, known_students = load_encodings_from_backend()
@@ -90,6 +91,12 @@ def recognize_attendance():
 
     classroom = input("Enter Classroom (e.g. 301): ").strip()
     marked = set()
+
+    # Load InsightFace ArcFace model once at startup
+    print("Loading InsightFace model...")
+    app = insightface.app.FaceAnalysis(name='buffalo_sc', providers=['CPUExecutionProvider'])
+    app.prepare(ctx_id=0, det_size=(320, 320))
+    print("✓ Model ready.")
 
     # Start camera
     cam = cv2.VideoCapture(0)
@@ -109,20 +116,25 @@ def recognize_attendance():
         if not ret or frame is None:
             continue
 
-        # Resize to 50% for faster processing
-        small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-        rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+        # InsightFace works directly on BGR — no need to convert to RGB
+        faces = app.get(frame)
 
-        face_locations = face_recognition.face_locations(rgb_small)
-        face_encodings = face_recognition.face_encodings(rgb_small, face_locations)
+        for face in faces:
+            query_enc = face.normed_embedding.astype(np.float32)
 
-        for face_encoding, face_location in zip(face_encodings, face_locations):
-            distances = face_recognition.face_distance(known_encodings, face_encoding)
-            best_idx = int(np.argmin(distances))
-            best_distance = distances[best_idx]
-            confidence_pct = round((1 - best_distance) * 100, 1)
+            # Cosine similarity — higher means more similar (opposite of dlib)
+            similarities = [float(np.dot(query_enc, k)) for k in known_encodings]
+            best_idx = int(np.argmax(similarities))
+            best_sim = similarities[best_idx]
+            confidence_pct = round(best_sim * 100, 1)
 
-            if best_distance < 0.6:
+            # Get bounding box from InsightFace
+            bbox = face.bbox.astype(int)
+            left, top, right, bottom = bbox[0], bbox[1], bbox[2], bbox[3]
+
+            # ArcFace threshold: >0.35 strong match, <0.20 clearly unknown
+            THRESHOLD = 0.35
+            if best_sim > THRESHOLD:
                 student = known_students[best_idx]
                 name = student["name"]
                 reg_no = student["registration_number"]
@@ -145,8 +157,6 @@ def recognize_attendance():
                 label = "Unknown"
                 colour = (0, 0, 255)
 
-            # Scale face location back up and draw
-            top, right, bottom, left = [v * 2 for v in face_location]
             cv2.rectangle(frame, (left, top), (right, bottom), colour, 2)
             cv2.putText(frame, label, (left + 5, top - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2)
 

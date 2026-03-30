@@ -1,7 +1,7 @@
-
-face-recognition
+insightface==0.7.3
+onnxruntime>=1.19.0
 opencv-python
-numpy
+numpy>=1.24,<2
 requests
 flask
 flask-cors
